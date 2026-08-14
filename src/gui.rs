@@ -1076,6 +1076,8 @@ struct AcceleratorApp {
     logo: egui::TextureHandle,
     autostart_enabled: bool,
     autostart_pending: bool,
+    #[cfg(target_os = "windows")]
+    start_hidden_pending: bool,
     #[cfg(target_os = "linux")]
     hidden_to_tray: bool,
     #[cfg(target_os = "linux")]
@@ -1217,6 +1219,8 @@ impl AcceleratorApp {
             logo,
             autostart_enabled,
             autostart_pending: auto_start,
+            #[cfg(target_os = "windows")]
+            start_hidden_pending: auto_start,
             #[cfg(target_os = "linux")]
             hidden_to_tray: false,
             #[cfg(target_os = "linux")]
@@ -2629,6 +2633,12 @@ impl AcceleratorApp {
 
 impl eframe::App for AcceleratorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "windows")]
+        if self.start_hidden_pending {
+            // 开机自启（--autostart）时窗口不弹出，直接最小化到托盘静默运行
+            self.start_hidden_pending = false;
+            self.minimize_to_tray(ctx);
+        }
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             self.poll_tray_events(ctx);
