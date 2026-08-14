@@ -1726,6 +1726,9 @@ mod tests {
         assert_eq!(&bytes[11..14], b"com");
         assert_eq!(bytes[14], 0);
         assert_eq!(collect_ech_param(&bytes), Some(&b"A"[..]));
+        // 中间空 label 仍必须拒绝（与尾点语义区分）
+        assert!(parse_dns_json_hex_rdata("1 a..b ech=QQ==").is_err());
+        assert!(parse_dns_json_hex_rdata("1 .. ech=QQ==").is_err());
     }
 
     #[test]
