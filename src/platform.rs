@@ -342,17 +342,9 @@ pub fn install_ca(ca_cert_path: &Path, common_name: &str) -> Result<()> {
     match std::env::consts::OS {
         "windows" => {
             let path = ca_cert_path.to_string_lossy();
-            run_command(
-                "powershell",
-                &[
-                    "-NoProfile",
-                    "-Command",
-                    &format!(
-                        "Import-Certificate -FilePath '{}' -CertStoreLocation Cert:\\LocalMachine\\Root",
-                        path
-                    ),
-                ],
-            )?;
+            // 用 certutil 而非 PowerShell：Import-Certificate 依赖 5.1 的 Cert: 驱动器，
+            // 从 pwsh 7 继承环境的提权链会缺 PSModulePath 导致 DriveNotFound
+            run_command("certutil", &["-addstore", "Root", &path])?;
         }
         "macos" => {
             match macos_ca_state(ca_cert_path, common_name)? {
@@ -503,17 +495,8 @@ fn macos_loopback_aliases(config: &AppConfig) -> Vec<String> {
 pub fn uninstall_ca(common_name: &str) -> Result<()> {
     match std::env::consts::OS {
         "windows" => {
-            let _ = run_command(
-                "powershell",
-                &[
-                    "-NoProfile",
-                    "-Command",
-                    &format!(
-                        "Get-ChildItem Cert:\\LocalMachine\\Root\\* | Where-Object {{ $_.Subject -like '*{}*' }} | Remove-Item -Force",
-                        common_name
-                    ),
-                ],
-            );
+            // certutil -delstore 按证书名称模糊匹配删除（无 PowerShell 模块依赖）
+            let _ = run_command("certutil", &["-delstore", "Root", common_name]);
         }
         "macos" => {
             let _ = run_command(
