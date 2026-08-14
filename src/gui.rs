@@ -2635,9 +2635,14 @@ impl eframe::App for AcceleratorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(target_os = "windows")]
         if self.start_hidden_pending {
-            // 开机自启（--autostart）时窗口不弹出，直接最小化到托盘静默运行
-            self.start_hidden_pending = false;
-            self.minimize_to_tray(ctx);
+            // 开机自启（--autostart）：等窗口真正显示后再隐藏到托盘（首帧 hide 会被
+            // winit 的首次显示覆盖，轮询可见性保证隐藏必定生效）
+            if let Some(hwnd) = self.window_handle {
+                if crate::platform::is_window_visible(hwnd) {
+                    self.start_hidden_pending = false;
+                    self.minimize_to_tray(ctx);
+                }
+            }
         }
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {

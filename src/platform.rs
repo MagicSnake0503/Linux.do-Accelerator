@@ -45,8 +45,9 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, LoadImageW, PostMessageW, SW_HIDE,
-    SW_NORMAL, SW_RESTORE, SW_SHOW, SendMessageW, SetForegroundWindow, ShowWindow, WM_CLOSE,
+    ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, IsWindowVisible, LoadImageW,
+    PostMessageW, SW_HIDE, SW_NORMAL, SW_RESTORE, SW_SHOW, SendMessageW, SetForegroundWindow,
+    ShowWindow, WM_CLOSE,
     WM_SETICON,
 };
 
@@ -773,6 +774,12 @@ pub fn hide_app_window(hwnd: isize) -> Result<()> {
     let shown = unsafe { ShowWindow(hwnd, SW_HIDE) };
     let _ = shown;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn is_window_visible(hwnd: isize) -> bool {
+    let hwnd = hwnd as HWND;
+    unsafe { IsWindowVisible(hwnd) != 0 }
 }
 
 #[cfg(target_os = "windows")]
