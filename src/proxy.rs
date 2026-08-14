@@ -1234,9 +1234,15 @@ fn parse_svcb_presentation_rdata(data: &str) -> Result<Vec<u8>> {
     if target == "." || target.is_empty() {
         body.push(0);
     } else {
+        let mut total_len = 0usize;
         for label in target.trim_end_matches('.').split('.') {
             anyhow::ensure!(!label.is_empty(), "invalid HTTPS RR target {target}");
             anyhow::ensure!(label.len() <= 63, "HTTPS RR target label too long: {label}");
+            total_len += 1 + label.len();
+            anyhow::ensure!(
+                total_len <= 255,
+                "HTTPS RR target exceeds 255-byte DNS name limit: {target}"
+            );
             body.push(label.len() as u8);
             body.extend_from_slice(label.as_bytes());
         }
@@ -1247,7 +1253,8 @@ fn parse_svcb_presentation_rdata(data: &str) -> Result<Vec<u8>> {
         let Some((key, value)) = token.split_once('=') else {
             continue; // 无值参数（如 mandatory），daemon 不需要
         };
-        if key != "ech" {
+        // RFC 9460：参数 mnemonic 大小写不敏感
+        if !key.eq_ignore_ascii_case("ech") {
             continue;
         }
         let value = value.trim_matches('"');
@@ -1507,4 +1514,115 @@ fn load_private_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut reader)
         .context("failed to parse private key")?
         .ok_or_else(|| anyhow::anyhow!("private key not found in {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 真实样例：oaifree DoH 对 linux.do 返回的 HTTPS 记录（2026-08-14 实测）
+    const REAL_LINUX_DO_HTTPS: &str = "1 . alpn=h3,h2 ipv4hint=104.20.16.234,172.66.166.61 ech=AEX+DQBB5wAgACBKC9LgE47IDtMgwi/5S/wQDb1stVYq6xxBs7MVqXYIZgAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA= ipv6hint=2606:4700:10::6814:10ea,2606:4700:10::ac42:a63d";
+
+    fn collect_ech_param(bytes: &[u8]) -> Option<&[u8]> {
+        let mut offset = 2usize; // skip priority
+        // skip target name (label sequence terminated by 0x00)
+        loop {
+            let &len = bytes.get(offset)?;
+            offset += 1;
+            if len == 0 {
+                break;
+            }
+            offset += len as usize;
+        }
+        while offset + 4 <= bytes.len() {
+            let key = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+            let len = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+            offset += 4;
+            if offset + len > bytes.len() {
+                return None;
+            }
+            if key == 5 {
+                return Some(&bytes[offset..offset + len]);
+            }
+            offset += len;
+        }
+        None
+    }
+
+    #[test]
+    fn presentation_parses_real_linux_do_record() {
+        let bytes = parse_dns_json_hex_rdata(REAL_LINUX_DO_HTTPS).expect("presentation parse");
+        // priority = 1
+        assert_eq!(&bytes[0..2], &[0x00, 0x01]);
+        // target = "." (root)
+        assert_eq!(bytes[2], 0x00);
+        // ech 参数存在且为 71 字节（真实 ECHConfigList 长度）
+        let ech = collect_ech_param(&bytes).expect("ech param present");
+        assert_eq!(ech.len(), 71);
+    }
+
+    #[test]
+    fn rfc3597_format_still_works() {
+        // \# 8 00 01 00 00 05 00 01 01 → priority=1, target=root, 参数 key=5(ech) len=1 value=0x01
+        let bytes = parse_dns_json_hex_rdata("\\# 8 00 01 00 00 05 00 01 01").expect("rfc3597 parse");
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(&bytes[0..2], &[0x00, 0x01]);
+        let ech = collect_ech_param(&bytes).expect("ech param present");
+        assert_eq!(ech, &[0x01]);
+    }
+
+    #[test]
+    fn base64_standard_vectors() {
+        assert_eq!(decode_base64_standard("").unwrap(), b"");
+        assert_eq!(decode_base64_standard("QQ==").unwrap(), b"A");
+        assert_eq!(decode_base64_standard("QUJD").unwrap(), b"ABC");
+        assert_eq!(decode_base64_standard("SGVsbG8=").unwrap(), b"Hello");
+        // 真实 ECHConfigList 为 71 字节
+        let ech = "AEX+DQBB5wAgACBKC9LgE47IDtMgwi/5S/wQDb1stVYq6xxBs7MVqXYIZgAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=";
+        assert_eq!(decode_base64_standard(ech).unwrap().len(), 71);
+    }
+
+    #[test]
+    fn presentation_rejects_garbage() {
+        assert!(parse_dns_json_hex_rdata("").is_err());
+        assert!(parse_dns_json_hex_rdata("1").is_err());
+        assert!(parse_dns_json_hex_rdata("not-a-number . alpn=h2").is_err());
+        assert!(parse_dns_json_hex_rdata("1 . ech=!!!not-base64!!!").is_err());
+        // 空 ech 值
+        assert!(parse_dns_json_hex_rdata("1 . ech=").is_err());
+        // 超长 target label（>63）
+        let long_label = format!("1 {} . ech=QQ==", "a".repeat(64));
+        assert!(parse_dns_json_hex_rdata(&long_label).is_err());
+        // 非法 base64 字符
+        assert!(parse_dns_json_hex_rdata("1 . ech=AB*CD==").is_err());
+    }
+
+    #[test]
+    fn presentation_with_named_target() {
+        // target = example.com → wire: 07 example 03 com 00
+        let bytes = parse_dns_json_hex_rdata("1 example.com ech=QQ==").unwrap();
+        assert_eq!(bytes[2], 7);
+        assert_eq!(&bytes[3..10], b"example");
+        assert_eq!(bytes[10], 3);
+        assert_eq!(&bytes[11..14], b"com");
+        assert_eq!(bytes[14], 0);
+        assert_eq!(collect_ech_param(&bytes), Some(&b"A"[..]));
+    }
+
+    #[test]
+    fn presentation_ech_key_is_case_insensitive() {
+        // RFC 9460：参数 mnemonic 大小写不敏感
+        let bytes = parse_dns_json_hex_rdata("1 . ECH=QQ==").unwrap();
+        assert_eq!(collect_ech_param(&bytes), Some(&b"A"[..]));
+    }
+
+    #[test]
+    fn presentation_target_respects_255_byte_limit() {
+        // 5 个 63 字节 label 超过 DNS 名称 255 字节上限
+        let overlong = format!("1 {} . ech=QQ==", format!("{}.", "a".repeat(63)).repeat(4) + &"a".repeat(63));
+        assert!(parse_dns_json_hex_rdata(&overlong).is_err());
+        // 边界内（3 个 63 + 1 个 61 = 254 字节，含 root 共 255）应成功
+        let boundary = format!("1 {} . ech=QQ==", format!("{}.", "a".repeat(63)).repeat(3) + &"a".repeat(61));
+        assert!(parse_dns_json_hex_rdata(&boundary).is_ok());
+    }
 }
