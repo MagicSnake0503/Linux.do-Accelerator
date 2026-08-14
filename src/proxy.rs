@@ -396,10 +396,19 @@ async fn dispatch_upstream_request(
     path_and_query: &str,
 ) -> Result<UpstreamResponse> {
     let upstream = resolve_upstream(state, request_host, upstream_port).await?;
-    let ech_config = upstream
-        .ech_config
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("ECH 强制模式：{request_host} 未提供可用的 ECH 配置"))?;
+    let Some(ech_config) = upstream.ech_config.clone() else {
+        // ECH 配置缺失（DoH 临时故障等）：清除缓存中的坏结果，
+        // 让下一次请求重新解析（自愈，避免持续 502）
+        remove_cached_upstream(
+            state,
+            &ResolveCacheKey {
+                host: request_host.to_ascii_lowercase(),
+                port: upstream_port,
+            },
+        )
+        .await;
+        anyhow::bail!("ECH 强制模式：{request_host} 未提供可用的 ECH 配置");
+    };
 
     let mut last_error = None;
     for addr in upstream.addrs.iter().copied() {
@@ -802,7 +811,18 @@ async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<Res
     let upstream = ResolvedUpstream { addrs, ech_config };
     let resolve_ttl = min_duration_options(binding_ttl, min_duration_options(addr_ttl, extra_ttl))
         .unwrap_or(FALLBACK_RESOLVE_CACHE_TTL);
-    write_cached_upstream(state, cache_key.clone(), upstream.clone(), resolve_ttl).await;
+    // 修复：ECH 强制模式下，解析不到 ECH 配置的坏结果不写缓存，
+    // 避免坏结果在 TTL 内持续命中导致 502（下一次请求会重新解析）
+    if upstream.ech_config.is_some() {
+        write_cached_upstream(state, cache_key.clone(), upstream.clone(), resolve_ttl).await;
+    } else {
+        log_upstream_debug(
+            state,
+            host,
+            "/",
+            "resolve ech=no, skip cache write to allow retry",
+        );
+    }
 
     let mut upstream = upstream;
     prioritize_preferred_upstream(state, &cache_key, &mut upstream.addrs).await;
@@ -948,6 +968,12 @@ async fn read_cached_upstream(state: &AppState, key: &ResolveCacheKey) -> Option
             None
         }
     })
+}
+
+/// 清除指定主机的解析缓存（用于 ECH 配置缺失时移除坏结果，实现自愈重试）。
+async fn remove_cached_upstream(state: &AppState, key: &ResolveCacheKey) {
+    let mut cache = state.resolve_cache.write().await;
+    cache.remove(key);
 }
 
 async fn prioritize_preferred_upstream(
