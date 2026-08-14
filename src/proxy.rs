@@ -1234,8 +1234,9 @@ fn parse_svcb_presentation_rdata(data: &str) -> Result<Vec<u8>> {
     if target == "." || target.is_empty() {
         body.push(0);
     } else {
+        let labels = split_svcb_target(target)?;
         let mut total_len = 0usize;
-        for label in target.trim_end_matches('.').split('.') {
+        for label in &labels {
             anyhow::ensure!(!label.is_empty(), "invalid HTTPS RR target {target}");
             anyhow::ensure!(label.len() <= 63, "HTTPS RR target label too long: {label}");
             total_len += 1 + label.len();
@@ -1249,6 +1250,7 @@ fn parse_svcb_presentation_rdata(data: &str) -> Result<Vec<u8>> {
         body.push(0);
     }
 
+    let mut ech_seen = false;
     for token in tokens.iter().skip(2) {
         let Some((key, value)) = token.split_once('=') else {
             continue; // 无值参数（如 mandatory），daemon 不需要
@@ -1257,6 +1259,9 @@ fn parse_svcb_presentation_rdata(data: &str) -> Result<Vec<u8>> {
         if !key.eq_ignore_ascii_case("ech") {
             continue;
         }
+        // RFC 9460：同一参数不得重复出现
+        anyhow::ensure!(!ech_seen, "duplicate ech parameter in HTTPS RR");
+        ech_seen = true;
         let value = value.trim_matches('"');
         let ech = decode_base64_standard(value)
             .with_context(|| format!("invalid ech base64 in HTTPS RR: {value}"))?;
@@ -1272,19 +1277,65 @@ fn parse_svcb_presentation_rdata(data: &str) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-/// 最小标准 base64 解码器（RFC 4648，含 padding），避免引入新依赖。
+/// 拆分 SVCB target 域名，支持 RFC 9460 的 `\.`（label 内点）与 `\\`（字面反斜杠）转义。
+fn split_svcb_target(target: &str) -> Result<Vec<String>> {
+    let mut labels = Vec::new();
+    let mut current = String::new();
+    let mut chars = target.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let Some(next) = chars.next() else {
+                    anyhow::bail!("trailing backslash in HTTPS RR target {target}");
+                };
+                current.push(next);
+            }
+            '.' => {
+                labels.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    labels.push(current);
+    Ok(labels)
+}
+
+/// 最小标准 base64 解码器（RFC 4648，含 padding 校验），避免引入新依赖。
 fn decode_base64_standard(input: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4 + 3);
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4 + 3);
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
-    for ch in input.bytes() {
+    let mut padding_seen = false;
+    for (idx, &ch) in bytes.iter().enumerate() {
+        if padding_seen {
+            // '=' 只能出现在末尾且至多两个
+            anyhow::ensure!(ch == b'=', "invalid base64 padding: non-padding after '='");
+            continue;
+        }
         let val = match ch {
             b'A'..=b'Z' => (ch - b'A') as u32,
             b'a'..=b'z' => (ch - b'a' + 26) as u32,
             b'0'..=b'9' => (ch - b'0' + 52) as u32,
             b'+' => 62,
             b'/' => 63,
-            b'=' => break,
+            b'=' => {
+                // 末尾至多两个 '='，且此前必须累积了 2 或 4 个残余位（1 或 2 个 padding 字符）
+                let remaining = bytes.len() - idx;
+                anyhow::ensure!(
+                    remaining == 1 || remaining == 2,
+                    "invalid base64 padding length"
+                );
+                anyhow::ensure!(
+                    bits == 2 || bits == 4,
+                    "invalid base64 padding position"
+                );
+                // canonical 编码要求残余位为零
+                let mask = if bits == 2 { 0b11u32 } else { 0b1111u32 };
+                anyhow::ensure!(acc & mask == 0, "non-canonical base64 padding");
+                padding_seen = true;
+                continue;
+            }
             _ => anyhow::bail!("invalid base64 character {ch:?}"),
         };
         acc = (acc << 6) | val;
@@ -1293,6 +1344,10 @@ fn decode_base64_standard(input: &str) -> Result<Vec<u8>> {
             bits -= 8;
             out.push((acc >> bits) as u8);
         }
+    }
+    // 无 padding 时输入长度必须为 4 的倍数（残余位为 0）
+    if !padding_seen {
+        anyhow::ensure!(bits == 0, "invalid base64 length");
     }
     Ok(out)
 }
@@ -1583,6 +1638,22 @@ mod tests {
     }
 
     #[test]
+    fn base64_rejects_non_canonical_padding() {
+        // 长度非法（%4 == 1）
+        assert!(decode_base64_standard("A").is_err());
+        assert!(decode_base64_standard("QUJDA").is_err());
+        // padding 位置非法
+        assert!(decode_base64_standard("Q===").is_err());
+        assert!(decode_base64_standard("======").is_err());
+        // padding 后出现非 '=' 字符
+        assert!(decode_base64_standard("QQ=Q").is_err());
+        // padding 超过两个
+        assert!(decode_base64_standard("QQ===").is_err());
+        // 非 canonical：残余位非零（AAB= 中低位为 1）
+        assert!(decode_base64_standard("AAB=").is_err());
+    }
+
+    #[test]
     fn presentation_rejects_garbage() {
         assert!(parse_dns_json_hex_rdata("").is_err());
         assert!(parse_dns_json_hex_rdata("1").is_err());
@@ -1624,5 +1695,26 @@ mod tests {
         // 边界内（3 个 63 + 1 个 61 = 254 字节，含 root 共 255）应成功
         let boundary = format!("1 {} . ech=QQ==", format!("{}.", "a".repeat(63)).repeat(3) + &"a".repeat(61));
         assert!(parse_dns_json_hex_rdata(&boundary).is_ok());
+    }
+
+    #[test]
+    fn presentation_supports_escaped_target_labels() {
+        // RFC 9460：\. 转义表示 label 内点 → 单个 label "foo.bar"
+        let bytes = parse_dns_json_hex_rdata("1 foo\\.bar.example.com ech=QQ==").unwrap();
+        assert_eq!(bytes[2], 7);
+        assert_eq!(&bytes[3..10], b"foo.bar");
+        assert_eq!(bytes[10], 7);
+        assert_eq!(&bytes[11..18], b"example");
+        assert_eq!(bytes[18], 3);
+        assert_eq!(&bytes[19..22], b"com");
+        assert_eq!(bytes[22], 0);
+        // 结尾反斜杠非法
+        assert!(parse_dns_json_hex_rdata("1 foo\\ ech=QQ==").is_err());
+    }
+
+    #[test]
+    fn presentation_rejects_duplicate_ech() {
+        // RFC 9460：同一参数不得重复
+        assert!(parse_dns_json_hex_rdata("1 . ech=QQ== ech=QQ==").is_err());
     }
 }
