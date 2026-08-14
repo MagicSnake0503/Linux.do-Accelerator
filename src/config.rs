@@ -179,13 +179,16 @@ impl AppConfig {
         }
 
         let backup_path = backup_config_path(path);
-        fs::copy(path, &backup_path).with_context(|| {
-            format!(
-                "failed to back up {} to {}",
-                path.display(),
-                backup_path.display()
-            )
-        })?;
+        // 首次运行时配置文件尚不存在，跳过备份（否则 fs::copy 必然失败导致静默退出）
+        if path.exists() {
+            fs::copy(path, &backup_path).with_context(|| {
+                format!(
+                    "failed to back up {} to {}",
+                    path.display(),
+                    backup_path.display()
+                )
+            })?;
+        }
         fs::write(path, DEFAULT_APP_CONFIG)
             .with_context(|| format!("failed to write config {}", path.display()))?;
         write_version_marker(&marker_path)?;

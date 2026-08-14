@@ -1056,6 +1056,8 @@ fn current_cli_binary() -> Result<PathBuf> {
         {
             return Ok(path);
         }
+        // 便携版/自定义文件名（如 edge 发布的 hash 命名 exe）：current_exe 即 CLI 二进制
+        return Ok(path);
     }
 
     bail!("failed to locate CLI binary")

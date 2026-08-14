@@ -1176,6 +1176,16 @@ fn parse_https_answer(raw_rdata: &str) -> Result<HttpsServiceBinding> {
 
 fn parse_dns_json_hex_rdata(raw_rdata: &str) -> Result<Vec<u8>> {
     let raw_rdata = raw_rdata.trim();
+    if raw_rdata.starts_with("\\#") {
+        parse_rfc3597_hex_rdata(raw_rdata)
+    } else {
+        // 主流 DoH 对 type=65 (HTTPS) 返回 SVCB presentation 文本格式，例如：
+        // "1 . alpn=h3,h2 ipv4hint=104.20.16.234,172.66.166.61 ech=AEX+DQBB5wAg... ipv6hint=..."
+        parse_svcb_presentation_rdata(raw_rdata)
+    }
+}
+
+fn parse_rfc3597_hex_rdata(raw_rdata: &str) -> Result<Vec<u8>> {
     let encoded = raw_rdata
         .strip_prefix("\\#")
         .with_context(|| format!("unexpected HTTPS RR format: {raw_rdata}"))?
@@ -1202,6 +1212,82 @@ fn parse_dns_json_hex_rdata(raw_rdata: &str) -> Result<Vec<u8>> {
     }
 
     Ok(bytes)
+}
+
+/// 解析 SVCB/HTTPS presentation 格式（RFC 9460 文本表示），转为 wire 字节。
+/// 例："1 . alpn=h3,h2 ipv4hint=104.20.16.234,172.66.166.61 ech=AEX+DQBB5wAg... ipv6hint=..."
+/// daemon 只消费 ech 参数（key=5），其余参数跳过。
+fn parse_svcb_presentation_rdata(data: &str) -> Result<Vec<u8>> {
+    let tokens: Vec<&str> = data.split_whitespace().collect();
+    if tokens.len() < 2 {
+        anyhow::bail!("unexpected HTTPS RR format: {data}");
+    }
+
+    let priority: u16 = tokens[0]
+        .parse()
+        .with_context(|| format!("invalid HTTPS RR priority: {}", tokens[0]))?;
+    let target = tokens[1];
+
+    let mut body = Vec::with_capacity(64);
+    body.extend_from_slice(&priority.to_be_bytes());
+
+    if target == "." || target.is_empty() {
+        body.push(0);
+    } else {
+        for label in target.trim_end_matches('.').split('.') {
+            anyhow::ensure!(!label.is_empty(), "invalid HTTPS RR target {target}");
+            anyhow::ensure!(label.len() <= 63, "HTTPS RR target label too long: {label}");
+            body.push(label.len() as u8);
+            body.extend_from_slice(label.as_bytes());
+        }
+        body.push(0);
+    }
+
+    for token in tokens.iter().skip(2) {
+        let Some((key, value)) = token.split_once('=') else {
+            continue; // 无值参数（如 mandatory），daemon 不需要
+        };
+        if key != "ech" {
+            continue;
+        }
+        let value = value.trim_matches('"');
+        let ech = decode_base64_standard(value)
+            .with_context(|| format!("invalid ech base64 in HTTPS RR: {value}"))?;
+        anyhow::ensure!(
+            !ech.is_empty() && ech.len() <= u16::MAX as usize,
+            "invalid ech parameter length in HTTPS RR"
+        );
+        body.extend_from_slice(&5u16.to_be_bytes());
+        body.extend_from_slice(&(ech.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ech);
+    }
+
+    Ok(body)
+}
+
+/// 最小标准 base64 解码器（RFC 4648，含 padding），避免引入新依赖。
+fn decode_base64_standard(input: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4 + 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for ch in input.bytes() {
+        let val = match ch {
+            b'A'..=b'Z' => (ch - b'A') as u32,
+            b'a'..=b'z' => (ch - b'a' + 26) as u32,
+            b'0'..=b'9' => (ch - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => anyhow::bail!("invalid base64 character {ch:?}"),
+        };
+        acc = (acc << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 fn parse_dns_name(data: &[u8]) -> Result<(String, usize)> {
