@@ -12,3 +12,4 @@ android/**/build/
 /build.bat
 /build.ps1
 /swap-and-restart.ps1
+/finalize.ps1
