@@ -112,7 +112,15 @@ pub async fn run_foreground(config_path: Option<PathBuf>, with_setup: bool) -> R
     state::mark_running(&paths, pid)?;
     let ui_managed_shutdown = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let watchdog = spawn_ui_lease_watchdog(paths.clone(), ui_managed_shutdown.clone(), shutdown_tx);
+    // ui_managed_daemon=false 时（服务器式运行/无 GUI 常驻），daemon 不依赖 GUI 心跳，
+    // GUI 关闭不会触发自动停止
+    let watchdog = if config.ui_managed_daemon {
+        spawn_ui_lease_watchdog(paths.clone(), ui_managed_shutdown.clone(), shutdown_tx)
+    } else {
+        tokio::spawn(async {
+            // 未启用 UI 托管：watchdog 空闲占位
+        })
+    };
     let result = run_proxy(config.clone(), paths.clone(), bundle, shutdown_rx).await;
     watchdog.abort();
     let _ = state::clear_pid_if_matches(&paths, pid);

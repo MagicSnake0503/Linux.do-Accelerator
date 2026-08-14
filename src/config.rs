@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub doh_endpoints: Vec<String>,
     #[serde(default = "default_managed_prefer_ipv6")]
     pub managed_prefer_ipv6: bool,
+    #[serde(default = "default_ui_managed_daemon")]
+    pub ui_managed_daemon: bool,
     #[serde(default)]
     pub dns_hosts: BTreeMap<String, String>,
     #[serde(default)]
@@ -101,6 +103,10 @@ fn default_doh_endpoints() -> Vec<String> {
 
 fn default_managed_prefer_ipv6() -> bool {
     false
+}
+
+fn default_ui_managed_daemon() -> bool {
+    true
 }
 
 fn default_proxy_domains() -> Vec<String> {
@@ -253,6 +259,7 @@ impl AppConfig {
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(default_doh_endpoints),
             managed_prefer_ipv6: default_managed_prefer_ipv6(),
+            ui_managed_daemon: default_ui_managed_daemon(),
             dns_hosts: BTreeMap::new(),
             edge_node: None,
             proxy_domains: legacy_network

@@ -9,6 +9,8 @@ doh_endpoints = [
     "https://aaa.ddd.oaifree.com/query-dns",
 ]
 managed_prefer_ipv6 = false
+# 是否由 GUI 托管（GUI 失联 8 秒自动停止加速）。服务器式/无 GUI 常驻场景设为 false
+ui_managed_daemon = true
 dns_hosts = {}
 edge_node = ""
 # example:
