@@ -1296,7 +1296,11 @@ fn split_svcb_target(target: &str) -> Result<Vec<String>> {
             _ => current.push(c),
         }
     }
-    labels.push(current);
+    // 绝对 FQDN 的尾点会在最后产生空 current，不 push（与旧 trim_end_matches('.') 行为一致）；
+    // 中间的连续点产生的空 label 已在上面的 '.' 分支被 push，会由调用方 ensure 拒绝。
+    if !current.is_empty() {
+        labels.push(current);
+    }
     Ok(labels)
 }
 
@@ -1710,6 +1714,18 @@ mod tests {
         assert_eq!(bytes[22], 0);
         // 结尾反斜杠非法
         assert!(parse_dns_json_hex_rdata("1 foo\\ ech=QQ==").is_err());
+    }
+
+    #[test]
+    fn presentation_accepts_trailing_dot_target() {
+        // 绝对 FQDN 尾点（DNS presentation 合法形式，回归：曾被误拒）
+        let bytes = parse_dns_json_hex_rdata("1 example.com. ech=QQ==").unwrap();
+        assert_eq!(bytes[2], 7);
+        assert_eq!(&bytes[3..10], b"example");
+        assert_eq!(bytes[10], 3);
+        assert_eq!(&bytes[11..14], b"com");
+        assert_eq!(bytes[14], 0);
+        assert_eq!(collect_ech_param(&bytes), Some(&b"A"[..]));
     }
 
     #[test]
